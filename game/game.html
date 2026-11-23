@@ -1,0 +1,332 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=540, initial-scale=1">
+<title>DOT DASH — day one vs day seven</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #111; overflow: hidden; }
+  canvas { display: block; width: 540px; height: 960px; }
+</style>
+</head>
+<body>
+<canvas id="game" width="540" height="960"></canvas>
+<script>
+"use strict";
+// DOT DASH — one tiny browser game, two builds.
+// Same map, same start, same scripted player path in both modes.
+// ?mode=day-one  -> grey, 5 orbs, no enemies, no particles, minimal HUD.
+// ?mode=day-seven -> colour, 3 orb types, 4 patrolling enemies, particles,
+//                    combo, timer, lives, power-up, decorations.
+// ?shot=<seconds> -> draw exactly one deterministic frame for that time
+//                    (used to record frame-perfect footage) and stop.
+// The whole game is a pure function of time t: same t, same frame, every run.
+const params = new URLSearchParams(location.search);
+const MODE = params.get("mode") === "day-seven" ? "day-seven" : "day-one";
+const DAY7 = MODE === "day-seven";
+
+const cv = document.getElementById("game");
+const ctx = cv.getContext("2d");
+const W = 540, H = 960;
+
+// Deterministic pseudo-random (mulberry32) so particles look the same every run.
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+let rand = mulberry32(20261123);
+
+// --- The map (identical in both builds) ---
+const OBSTACLES = [
+  { x: 428, y: 110, w: 84, h: 70 },
+  { x: 28,  y: 300, w: 70, h: 84 },
+  { x: 432, y: 470, w: 76, h: 70 },
+  { x: 30,  y: 600, w: 60, h: 62 },
+];
+// The player's scripted route: 8 waypoints, 2 s per leg, 16 s loop.
+// The first 3 seconds (start -> waypoint 1) are byte-identical in both builds.
+const WAYPOINTS = [
+  [270, 820], [120, 700], [420, 620], [150, 450],
+  [400, 350], [270, 200], [120, 480], [420, 760],
+];
+const LEG = 2, PERIOD = WAYPOINTS.length * LEG;
+
+function smooth(u) { return u * u * (3 - 2 * u); }
+function playerPos(t) {
+  const lt = t % PERIOD;
+  const i = Math.floor(lt / LEG);
+  const u = smooth((lt % LEG) / LEG);
+  const a = WAYPOINTS[i], b = WAYPOINTS[(i + 1) % WAYPOINTS.length];
+  return [a[0] + (b[0] - a[0]) * u, a[1] + (b[1] - a[1]) * u];
+}
+function midpoint(i) {
+  const a = WAYPOINTS[i], b = WAYPOINTS[(i + 1) % WAYPOINTS.length];
+  return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+}
+
+// --- Orbs (all sit on the route, so the scripted player collects them) ---
+function buildOrbs() {
+  const orbs = [];
+  if (!DAY7) {
+    [1, 2, 3, 4, 5].forEach(i => orbs.push({
+      x: WAYPOINTS[i][0], y: WAYPOINTS[i][1], kind: "plain", value: 10, taken: false,
+    }));
+  } else {
+    const kinds = ["gold", "cyan", "pink"];
+    for (let i = 1; i < WAYPOINTS.length; i++) {
+      orbs.push({ x: WAYPOINTS[i][0], y: WAYPOINTS[i][1],
+        kind: kinds[(i - 1) % 3], value: [10, 25, 50][(i - 1) % 3], taken: false });
+    }
+    [0, 2, 4, 6].forEach((leg, k) => {
+      const m = midpoint(leg);
+      orbs.push({ x: m[0], y: m[1], kind: kinds[k % 3],
+        value: [10, 25, 50][k % 3], taken: false });
+    });
+    const pm = midpoint(5);
+    orbs.push({ x: pm[0], y: pm[1], kind: "power", value: 100, taken: false });
+  }
+  return orbs;
+}
+const ORB_COLORS = { plain: "#9a9a9a", gold: "#ffd23f", cyan: "#35e0e6", pink: "#ff5fa2", power: "#ffffff" };
+
+// --- Enemies (day seven only): deterministic patrols ---
+const ENEMIES = DAY7 ? [
+  { cx: 270, cy: 520, r: 95,  speed: 0.8,  phase: 0 },
+  { cx: 150, cy: 660, r: 62,  speed: -1.1, phase: 1.5 },
+  { cx: 400, cy: 300, r: 72,  speed: 0.6,  phase: 2.2 },
+  { cx: 270, cy: 560, r: 0,   speed: 0.7,  phase: 0 }, // horizontal patrol
+] : [];
+function enemyPos(e, t) {
+  if (e.r === 0) return [270 + 180 * Math.sin(t * e.speed), e.cy];
+  const a = t * e.speed + e.phase;
+  return [e.cx + e.r * Math.cos(a), e.cy + e.r * Math.sin(a) * 0.62];
+}
+
+// --- State (reset for every deterministic render) ---
+let ORBS, score, combo, lastCollect, lives, powerUntil, particles, trail;
+function resetState() {
+  ORBS = buildOrbs();
+  score = 0; combo = 0; lastCollect = -10; lives = 3; powerUntil = -1;
+  particles = []; trail = [];
+  rand = mulberry32(20261123);
+}
+
+function collect(o, t) {
+  o.taken = true;
+  combo = (t - lastCollect < 2.5) ? combo + 1 : 1;
+  lastCollect = t;
+  score += o.value * Math.max(1, combo);
+  if (o.kind === "power") powerUntil = t + 2;
+  if (DAY7) {
+    for (let i = 0; i < 16; i++) {
+      const a = rand() * Math.PI * 2, sp = 40 + rand() * 160;
+      particles.push({ x: o.x, y: o.y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+        life: 0.7 + rand() * 0.4, max: 1.1, color: ORB_COLORS[o.kind], r: 2 + rand() * 4 });
+    }
+  }
+}
+
+// One fixed simulation step at time t (no drawing here).
+function simulateStep(t, dt) {
+  const [px, py] = playerPos(t);
+  ORBS.forEach(o => {
+    if (!o.taken && Math.hypot(px - o.x, py - o.y) < 34) collect(o, t);
+  });
+  particles = particles.filter(p => (p.life -= dt) > 0);
+  particles.forEach(p => { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 60 * dt; });
+  if (DAY7) {
+    trail.push({ x: px, y: py, life: 0.35 });
+    if (trail.length > 14) trail.shift();
+  }
+  trail.forEach(p => p.life -= dt);
+  trail = trail.filter(p => p.life > 0);
+}
+
+// Draw the frame for time t (pure: reads state only).
+function draw(t) {
+  const [px, py] = playerPos(t);
+  drawBackground(t);
+  drawOrbs(t);
+  drawEnemies(t);
+  particles.forEach(p => {
+    ctx.globalAlpha = Math.max(0, p.life / p.max);
+    ctx.fillStyle = p.color;
+    ctx.beginPath(); ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2); ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+  drawPlayer(px, py, t);
+  drawHUD(t);
+}
+
+// Deterministic render: simulate from 0 to t in 1/60 steps, then draw once.
+function renderAt(t) {
+  resetState();
+  const steps = Math.round(t * 60);
+  for (let i = 0; i <= steps; i++) simulateStep(i / 60, 1 / 60);
+  draw(t);
+  return { score, combo, t };
+}
+window.renderAt = renderAt;
+
+function drawBackground(t) {
+  if (!DAY7) {
+    ctx.fillStyle = "#8a8a8a"; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "#7d7d7d";
+    for (let y = 0; y < H; y += 80) for (let x = (y / 80 % 2 ? 40 : 0); x < W; x += 80)
+      ctx.fillRect(x, y, 40, 40);
+  } else {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, "#1b2a6b"); g.addColorStop(0.55, "#274b9f"); g.addColorStop(1, "#3d1f6e");
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+    ctx.fillStyle = "rgba(255,255,255,0.06)";
+    for (let y = 0; y < H; y += 80) for (let x = (y / 80 % 2 ? 40 : 0); x < W; x += 80)
+      ctx.fillRect(x, y, 40, 40);
+    // decorations: stars, flowers, clouds (fixed positions, gentle bob)
+    ctx.fillStyle = "#ffe66d";
+    [[60, 140], [480, 240], [90, 880], [470, 830], [300, 90]].forEach(([x, y], i) => {
+      const yy = y + Math.sin(t * 1.2 + i) * 4;
+      ctx.beginPath(); ctx.arc(x, yy, 4, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.fillStyle = "#ff8fb3";
+    [[200, 120], [360, 900], [470, 560]].forEach(([x, y]) => {
+      for (let p = 0; p < 5; p++) {
+        const a = p * Math.PI * 2 / 5;
+        ctx.beginPath(); ctx.arc(x + Math.cos(a) * 7, y + Math.sin(a) * 7, 4, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.fillStyle = "#ffd23f";
+      ctx.beginPath(); ctx.arc(x, y, 4, 0, Math.PI * 2); ctx.fill();
+      ctx.fillStyle = "#ff8fb3";
+    });
+    ctx.fillStyle = "rgba(255,255,255,0.16)";
+    [[120, 250], [380, 420]].forEach(([x, y], i) => {
+      const xx = x + Math.sin(t * 0.4 + i * 2) * 14;
+      ctx.beginPath(); ctx.ellipse(xx, y, 42, 16, 0, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  // obstacles (same geometry both builds)
+  OBSTACLES.forEach(o => {
+    ctx.fillStyle = DAY7 ? "#ff9f1c" : "#6f6f6f";
+    ctx.fillRect(o.x, o.y, o.w, o.h);
+    ctx.fillStyle = DAY7 ? "#e07b00" : "#5d5d5d";
+    ctx.fillRect(o.x, o.y + o.h - 10, o.w, 10);
+  });
+}
+
+function drawOrbs(t) {
+  ORBS.forEach(o => {
+    if (o.taken) return;
+    const bob = DAY7 ? Math.sin(t * 3 + o.x) * 3 : 0;
+    const y = o.y + bob;
+    if (o.kind === "power") {
+      const s = 26 + Math.sin(t * 6) * 4;
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      for (let p = 0; p < 10; p++) {
+        const a = p * Math.PI / 5 - Math.PI / 2, r = p % 2 ? s * 0.45 : s;
+        const px = o.x + Math.cos(a) * r, py = y + Math.sin(a) * r;
+        p ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+      }
+      ctx.closePath(); ctx.fill();
+      ctx.fillStyle = "#ffd23f";
+      ctx.beginPath(); ctx.arc(o.x, y, 7, 0, Math.PI * 2); ctx.fill();
+      return;
+    }
+    ctx.fillStyle = ORB_COLORS[o.kind];
+    ctx.beginPath(); ctx.arc(o.x, y, o.kind === "pink" ? 15 : 13, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = "rgba(255,255,255,0.75)";
+    ctx.beginPath(); ctx.arc(o.x - 4, y - 4, 4, 0, Math.PI * 2); ctx.fill();
+    if (o.kind === "cyan") {
+      ctx.strokeStyle = "#a5f3f5"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.arc(o.x, y, 18 + Math.sin(t * 4) * 2, 0, Math.PI * 2); ctx.stroke();
+    }
+  });
+}
+
+function drawEnemies(t) {
+  ENEMIES.forEach((e) => {
+    const [x, y] = enemyPos(e, t);
+    ctx.save(); ctx.translate(x, y);
+    ctx.rotate(Math.atan2(Math.sin(t * e.speed + e.phase), Math.cos(t * e.speed + e.phase)) + Math.PI / 2);
+    ctx.fillStyle = "#ff3b30";
+    ctx.beginPath(); ctx.moveTo(0, -18); ctx.lineTo(14, 14); ctx.lineTo(-14, 14); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#ffffff";
+    ctx.beginPath(); ctx.arc(0, 2, 4, 0, Math.PI * 2); ctx.fill();
+    ctx.restore();
+  });
+}
+
+function drawPlayer(x, y, t) {
+  if (DAY7) {
+    trail.forEach(p => {
+      ctx.globalAlpha = Math.max(0, p.life / 0.35) * 0.45;
+      ctx.fillStyle = t < powerUntil ? "#ff5fa2" : "#35e0e6";
+      ctx.beginPath(); ctx.arc(p.x, p.y, 10, 0, Math.PI * 2); ctx.fill();
+    });
+    ctx.globalAlpha = 1;
+  }
+  ctx.fillStyle = DAY7 ? (t < powerUntil ? "#ff5fa2" : "#35e0e6") : "#e8e8e8";
+  ctx.beginPath(); ctx.arc(x, y, 16, 0, Math.PI * 2); ctx.fill();
+  ctx.fillStyle = "#191419";
+  ctx.beginPath(); ctx.arc(x - 5, y - 4, 3, 0, Math.PI * 2); ctx.fill();
+  ctx.beginPath(); ctx.arc(x + 5, y - 4, 3, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = "#191419"; ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(x, y + 3, 6, 0.2 * Math.PI, 0.8 * Math.PI); ctx.stroke();
+}
+
+function drawHUD(t) {
+  ctx.textBaseline = "top";
+  if (!DAY7) {
+    ctx.fillStyle = "#e8e8e8"; ctx.font = "bold 26px monospace";
+    ctx.fillText("SCORE " + score, 20, 18);
+    ctx.font = "bold 22px monospace"; ctx.fillStyle = "#d5d5d5";
+    ctx.fillText("DAY ONE", 20, 52);
+    return;
+  }
+  // top bar
+  ctx.fillStyle = "rgba(10,10,30,0.55)"; ctx.fillRect(0, 0, W, 92);
+  ctx.font = "bold 30px monospace"; ctx.fillStyle = "#ffffff";
+  ctx.fillText("SCORE " + score, 20, 16);
+  ctx.fillStyle = "#ff5fa2"; ctx.font = "bold 28px monospace";
+  ctx.fillText("♥".repeat(lives), 20, 52);
+  ctx.fillStyle = "#ffd23f"; ctx.font = "bold 30px monospace";
+  ctx.fillText("COMBO x" + Math.max(1, combo), 300, 16);
+  const mm = Math.floor(t / 60), ss = Math.floor(t % 60);
+  ctx.fillStyle = "#ffffff"; ctx.font = "bold 28px monospace";
+  ctx.fillText("⏱ " + mm + ":" + String(ss).padStart(2, "0"), 330, 52);
+  ctx.fillStyle = "#35e0e6"; ctx.font = "bold 22px monospace";
+  ctx.fillText("DAY SEVEN", 20, 880);
+  if (t < powerUntil) {
+    ctx.fillStyle = "#ffd23f"; ctx.font = "bold 44px monospace";
+    ctx.textAlign = "center";
+    ctx.fillText("POWER-UP!", W / 2, 420);
+    ctx.textAlign = "left";
+  }
+}
+
+// Live play loop (normal browsing); shot mode renders one frame and stops;
+// drive mode exposes renderAt only — the recorder drives every frame itself,
+// so no live loop may repaint between renderAt and the screenshot.
+if (params.has("shot")) {
+  renderAt(parseFloat(params.get("shot")));
+  window.__ready = true;
+} else if (params.has("drive")) {
+  resetState();
+} else {
+  resetState();
+  const startTime = performance.now();
+  let prevT = 0;
+  (function frame(now) {
+    const t = (now - startTime) / 1000;
+    simulateStep(t, Math.min(0.05, Math.max(0, t - prevT)));
+    prevT = t;
+    draw(t);
+    requestAnimationFrame(frame);
+  })(startTime);
+}
+</script>
+</body>
+</html>
